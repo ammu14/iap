@@ -1,7 +1,7 @@
 #include "iap.h"
 #include "boot_config.h"
 #include "boot_verify.h"
-#include "boot_protocol.h"
+#include "ymodem.h"
 #include "ff.h"
 #include "stm32f407xx.h"
 #include "fatfs.h"
@@ -21,13 +21,6 @@ extern UART_HandleTypeDef huart1;
 
 /*
  * 跳转到 APP 区执行
- *
- * 这是 Bootloader 最底层的跳转原语:
- *   1. 检查 SP 是否落在 SRAM 范围 (0x20000000 ~ 0x20020000)
- *   2. 关全局中断 → 设置 MSP → 跳转到 APP 复位向量
- *   3. 若 SP 非法则静默返回, 由调用者处理错误
- *
- * 上层 boot_manager.c 在跳转前应通过 boot_verify_app() 校验固件完整性.
  */
 void iap_load_app(uint32_t appxaddr)
 {
@@ -41,42 +34,69 @@ void iap_load_app(uint32_t appxaddr)
     }
 }
 
-/*
- * 构建一个协议包到 buf 中 (与上位机 flash_tool.py 格式完全一致)
- * 返回实际包长度
- */
-static uint32_t build_protocol_packet(uint8_t *buf, uint8_t cmd, uint32_t addr,
-                                       const uint8_t *data, uint32_t data_len)
+/* ====== Flash 写入辅助 (自动对齐到 word) ====== */
+static int flash_write(uint32_t addr, const uint8_t *data, uint32_t len)
 {
-    /* buf 布局: header(1) + cmd(1) + addr(4) + len(4) + data(data_len) + crc(4) + tail(1) */
-    buf[0] = PACKET_HEADER;
-    buf[1] = cmd;
-    *(uint32_t *)(buf + 2)  = addr;
-    *(uint32_t *)(buf + 6)  = data_len;
-    if (data_len > 0 && data != NULL) {
-        memcpy(buf + 10, data, data_len);
-    }
-    /* CRC32 覆盖: cmd + addr + len + data */
-    uint32_t payload_len = 1 + 4 + 4 + data_len;   /* cmd(1) + addr(4) + len(4) + data */
-    uint32_t calc_crc = boot_crc32(buf + 1, payload_len);
-    uint32_t crc_offset = 10 + data_len;
-    *(uint32_t *)(buf + crc_offset) = calc_crc;
-    buf[crc_offset + 4] = PACKET_TAIL;
+    if (len == 0) return 0;
 
-    return crc_offset + 5;  /* 总长度: 1 + payload_len + 4(crc) + 1(tail) */
+    uint32_t buf[256];  /* 栈上对齐缓冲区, 每批最多 1024 字节 */
+    uint32_t written = 0;
+
+    while (len > 0) {
+        uint32_t chunk = (len > 1024) ? 1024 : len;
+        uint32_t words = (chunk + 3) / 4;
+
+        memcpy(buf, data + written, chunk);
+        if (chunk < words * 4) {
+            memset((uint8_t*)buf + chunk, 0xFF, words * 4 - chunk);
+        }
+
+        if (stmflash_write_word(addr + written, buf, words) != 0)
+            return -1;
+
+        written += chunk;
+        len    -= chunk;
+    }
+    return 0;
+}
+
+/* ====== 擦除整个 APP 区 (Sector 4~11, 960KB) ====== */
+static int erase_app_region(void)
+{
+    static const uint32_t sector_addrs[] = {
+        0x08010000, /* Sector 4  (64KB)  */
+        0x08020000, /* Sector 5  (128KB) */
+        0x08040000, /* Sector 6  (128KB) */
+        0x08060000, /* Sector 7  (128KB) */
+        0x08080000, /* Sector 8  (128KB) */
+        0x080A0000, /* Sector 9  (128KB) */
+        0x080C0000, /* Sector 10 (128KB) */
+        0x080E0000, /* Sector 11 (128KB) */
+    };
+
+    for (int i = 0; i < 8; i++) {
+        stmflash_erase_addr(sector_addrs[i]);
+    }
+    return 0;
+}
+
+/* ====== Ymodem 回调 ====== */
+static int ymodem_flash_cb(uint32_t offset, const uint8_t *data, uint32_t len)
+{
+    return flash_write(FLASH_APP_ADDR + offset, data, len);
+}
+
+static uint32_t g_ymodem_total = 0;
+static void ymodem_done_cb(uint32_t total_size)
+{
+    g_ymodem_total = total_size;
 }
 
 /* ======================================================================
  * SD 卡升级
  *
- * 与 UART 升级共享同一套协议处理:
- *   1. 挂载 SD, 打开 app.bin
- *   2. 初始化协议栈 → 执行擦除
- *   3. 分块读取文件 → 组协议包 → boot_protocol_process() 写入
- *   4. 发 VERIFY 命令 → 由协议栈校验
- *
- * 协议帧格式: Header(0xAA) + Cmd + Addr + Len + Data + CRC32 + Tail(0x55)
- * 与 UART 路径和 flash_tool.py 完全一致.
+ * 直接从 SD 卡读取 app.bin, 擦除 Flash 后逐块写入.
+ * 不经过任何协议栈, 是最快的升级路径.
  * ====================================================================== */
 int iap_load_from_sd(void) 
 {
@@ -84,66 +104,53 @@ int iap_load_from_sd(void)
     FIL fil;
     UINT br;
     uint32_t flash_addr = FLASH_APP_ADDR;
-    uint8_t read_buf[BOOT_PACKET_DATA_SIZE];
-    uint8_t pkt_buf[BOOT_PACKET_DATA_SIZE + 15];  /* 最大包缓冲区 */
+    uint8_t read_buf[1024];
     static char str_buf[40];
-    
-    // 挂载
+
+    /* 1. 挂载 SD */
     res = f_mount(&SDFatFS, SDPath, 1);
     if (res != FR_OK) {
-        LCD_ShowString(30, 210, 200, 16, 16, "SD mount FAIL!        ");
+        POINT_COLOR = RED;
+        LCD_ShowString(LCD_X, LCD_LINE_S2, 280, LCD_FONT_H, LCD_FONT_W, "SD: Mount FAIL!");
         return -1;
     }
 
-    // 打开文件
+    /* 2. 打开 app.bin */
     res = f_open(&fil, "app.bin", FA_READ);
     if (res != FR_OK) {
-        LCD_ShowString(30, 210, 200, 16, 16, "app.bin not found!    ");
+        POINT_COLOR = RED;
+        LCD_ShowString(LCD_X, LCD_LINE_S2, 280, LCD_FONT_H, LCD_FONT_W, "SD: app.bin not found!");
         f_mount(NULL, SDPath, 1);
         return -2;
     }
 
     FSIZE_t fsize = f_size(&fil);
-    if(fsize > FLASH_APP_SIZE - FLASH_APP_META_SIZE) 
-    {
-        LCD_ShowString(30, 210, 200, 16, 16, "File too large!       ");
+    if (fsize > FLASH_APP_SIZE - FLASH_APP_META_SIZE) {
+        POINT_COLOR = RED;
+        LCD_ShowString(LCD_X, LCD_LINE_S2, 280, LCD_FONT_H, LCD_FONT_W, "SD: File too large!");
         f_close(&fil);
         f_mount(NULL, SDPath, 1);
         return -3;
     }
-    
-    snprintf(str_buf, sizeof(str_buf), "File size: %lu bytes  ", (unsigned long)fsize);
-    LCD_ShowString(30, 190, 200, 16, 16, (uint8_t *)str_buf);
-    
-    /* 初始化协议栈, 通过协议栈走 ERASE→WRITING→WRITE→VERIFY 完整流程 */
-    boot_protocol_init();
 
-    {
-        /* 1. 发送 SYNC 包 → 协议栈进入 PROT_STATE_SYNCED */
-        uint32_t sync_len = build_protocol_packet(pkt_buf, CMD_SYNC, 0, NULL, 0);
-        boot_protocol_process(pkt_buf, sync_len);
-    }
+    snprintf(str_buf, sizeof(str_buf), "SD: %lu bytes", (unsigned long)fsize);
+    POINT_COLOR = BLACK;
+    LCD_ShowString(LCD_X, LCD_LINE_S2, 280, LCD_FONT_H, LCD_FONT_W, (uint8_t*)str_buf);
 
-    {
-        /* 2. 发送 ERASE 包 → PROT_STATE_ERASE_PENDING,
-         *    然后调用 boot_protocol_perform_erase() 执行实际擦除 + 切到 WRITING.
-         *    SD 路径下擦除是同步的, 不需要 DMA 延迟擦除机制. */
-        uint32_t erase_len = build_protocol_packet(pkt_buf, CMD_ERASE, 0, NULL, 0);
-        boot_protocol_process(pkt_buf, erase_len);
-        boot_protocol_perform_erase();  /* 内部调用 erase_app_region(), → PROT_STATE_WRITING */
-    }
+    /* 3. 擦除 APP 区 */
+    POINT_COLOR = BLACK;
+    LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Erasing...");
+    erase_app_region();
 
-    /* 3. 逐块读取文件, 组 CMD_WRITE 包 → 协议栈统一写入 Flash */
+    /* 4. 逐块写入 Flash */
     while (f_read(&fil, read_buf, sizeof(read_buf), &br) == FR_OK && br > 0) {
-        uint32_t pkt_len = build_protocol_packet(pkt_buf, CMD_WRITE, flash_addr,
-                                                  read_buf, br);
-        boot_protocol_process(pkt_buf, pkt_len);
+        flash_write(flash_addr, read_buf, br);
         flash_addr += br;
 
-        /* 进度显示 */
-        snprintf(str_buf, sizeof(str_buf), "Writing %lu/%lu       ",
+        snprintf(str_buf, sizeof(str_buf), "Writing %lu/%lu",
                  (unsigned long)(flash_addr - FLASH_APP_ADDR), (unsigned long)fsize);
-        LCD_ShowString(30, 210, 200, 16, 16, (uint8_t *)str_buf);
+        POINT_COLOR = BLUE;
+        LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, (uint8_t*)str_buf);
 
         if (br < sizeof(read_buf))
             break;
@@ -152,158 +159,187 @@ int iap_load_from_sd(void)
     f_close(&fil);
     f_mount(NULL, SDPath, 1);
 
-    /* 4. 构建并写入固件元数据 (FirmwareHeader_t) 到 APP 区末尾
-     *    CRC 从刚写入的 Flash 中回读计算, 与旧 SD 路径行为一致 */
+    /* 5. 写入固件元数据 */
     {
-        uint32_t cal_crc = boot_crc32((const uint8_t *)FLASH_APP_ADDR, (uint32_t)fsize);
+        uint32_t calc_crc = boot_crc32((const uint8_t*)FLASH_APP_ADDR, (uint32_t)fsize);
         FirmwareHeader_t header;
-        header.magic = FIRMWARE_MAGIC;
+        header.magic         = FIRMWARE_MAGIC;
         header.firmware_size = (uint32_t)fsize;
-        header.firmware_crc = cal_crc;
+        header.firmware_crc  = calc_crc;
         memset(header.reserved, 0xFF, sizeof(header.reserved));
 
         uint32_t meta_addr = FLASH_APP_ADDR + FLASH_APP_META_OFFSET;
-        uint32_t meta_len = build_protocol_packet(pkt_buf, CMD_WRITE, meta_addr,
-                                                   (uint8_t *)&header, sizeof(header));
-        boot_protocol_process(pkt_buf, meta_len);
+        flash_write(meta_addr, (const uint8_t*)&header, sizeof(header));
     }
 
-    /* 5. 发送 VERIFY 包 → 协议栈调用 boot_verify_app() 校验 */
-    {
-        uint32_t verify_len = build_protocol_packet(pkt_buf, CMD_VERIFY, 0, NULL, 0);
-        boot_protocol_process(pkt_buf, verify_len);
+    /* 6. 校验 */
+    POINT_COLOR = BLACK;
+    LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Verifying...");
+
+    if (boot_verify_app() != 0) {
+        POINT_COLOR = RED;
+        LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Verify FAILED!");
+        return -4;
     }
 
-    if (boot_protocol_get_state() == PROT_STATE_DONE) {
-        LCD_ShowString(30, 210, 200, 16, 16, "SD Upgrade OK!        ");
-        return 0;
-    }
-    
-    LCD_ShowString(30, 210, 200, 16, 16, "Verify FAILED!        ");
-    return -4;
+    POINT_COLOR = GREEN;
+    LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "SD Upgrade OK!");
+    return 0;
 }
 
 /* ======================================================================
- * 串口升级
- * 初始化协议栈 → 启动 DMA 接收 → 循环解析协议包 → 校验 → 完成
- * 返回 0 成功, 负数失败
+ * 串口升级 (Ymodem 协议)
+ *
+ * 使用标准 Ymodem 协议, 兼容 SecureCRT / Tera Term / SSCOM 等
+ * 任何支持 Ymodem 发送的串口终端.
+ *
+ * 流程:
+ *   1. 擦除 APP 区
+ *   2. 启动 UART DMA 接收
+ *   3. 发送 'C' → 终端开始 Ymodem 传输
+ *   4. 循环: IDLE 中断收数据 → 喂 ymodem 状态机 → 回 ACK/NAK
+ *   5. 传输完成 → 写元数据 → 校验
  * ====================================================================== */
 int iap_load_from_uart(void)
 {
-    uint32_t start_tick = HAL_GetTick();
+    uint8_t tx_data[2];
+    static char str_buf[40];
 
-    /* 停止之前的 DMA 循环接收, 重置缓冲区写指针 */
+    /* 1. 初始化 Ymodem 并擦除 APP 区 */
+    ymodem_init(ymodem_flash_cb, ymodem_done_cb);
+    g_ymodem_total = 0;
+
+    POINT_COLOR = BLACK;
+    LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Erasing...");
+    erase_app_region();
+
+    /* 2. 启动 DMA 循环接收 */
     HAL_UART_DMAStop(&huart1);
-    app_len = 0;
-    boot_protocol_init();
+    app_len      = 0;
+    is_receiving = 0;
     HAL_UART_Receive_DMA(&huart1, app_sram_buf, APP_MAX_SIZE);
 
-    LCD_ShowString(30, 210, 200, 16, 16, "UART Upgrade mode...");
-    LCD_ShowString(30, 230, 200, 16, 16, "Send firmware via UART");
+    /* 3. 发送 'C' 发起 Ymodem 传输 */
+    ymodem_reset();
+    int tx_len = ymodem_get_tx_data(tx_data);
+    if (tx_len > 0) {
+        HAL_UART_Transmit(&huart1, tx_data, tx_len, 100);
+    }
 
-    while (1)
-    {
+    POINT_COLOR = BLACK;
+    LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Waiting Ymodem sender...");
+
+    /* 4. 主循环 */
+    while (1) {
         uint32_t now = HAL_GetTick();
 
-        /* ---- 超时检查 ---- */
-        if (now - start_tick > UPGRADE_TIMEOUT_MS) {
-            LCD_ShowString(30, 210, 200, 16, 16, "Upgrade Timeout!      ");
-            HAL_UART_DMAStop(&huart1);
-            return -1;
+        /* 初始握手阶段: 如果还没收到任何数据, 每隔500ms重发 'C', 一直等上位机 */
+        {
+            static uint32_t last_c_send = 0;
+            YmodemState_t ys_now = ymodem_get_state();
+            if ((ys_now == YMODEM_STATE_WAIT_HEADER || ys_now == YMODEM_STATE_IDLE)
+                && app_len == 0
+                && now - last_c_send > 500) {
+                uint8_t c = 0x43;
+                HAL_UART_Transmit(&huart1, &c, 1, 100);
+                last_c_send = now;
+            }
         }
 
-        /* ---- 延迟擦除: DMA 运行期间执行实际 Flash 擦除 ---- */
-        if (boot_protocol_get_state() == PROT_STATE_ERASE_PENDING) {
-            boot_protocol_perform_erase();
-        }
-
-        /* ---- DMA 接收处理 ---- */
+        /* IDLE 中断通知: 有新的 DMA 数据到达 */
         if (is_receiving) {
+            /*
+             * ★ 关键: 先快速冻结 DMA 并读取数据量, 然后立刻重启 DMA.
+             *    这样 DMA 只停极短时间, 上位机发送的下一包数据不会丢失.
+             *    ymodem 解析和 Flash 写入在后面进行, DMA 持续运行.
+             */
             __disable_irq();
             is_receiving = 0;
-
-            /* 停止 DMA, 冻结缓冲区, 读取当前 NDTR 计算已收字节数 */
             HAL_UART_DMAStop(&huart1);
-            uint32_t ndtr = hdma_usart1_rx.Instance->NDTR;
-            uint32_t new_bytes = APP_MAX_SIZE - ndtr - app_len;
-
-            if (new_bytes > 0) {
+            uint32_t ndtr      = hdma_usart1_rx.Instance->NDTR;
+            uint32_t new_bytes  = APP_MAX_SIZE - ndtr - app_len;
+            if (new_bytes > 0)
                 app_len += new_bytes;
-            }
-
-            uint32_t cur_app_len = app_len;
+            uint32_t cur_len = app_len;
             __enable_irq();
 
-            /*
-             * 变长协议包解析: 从缓冲区中逐个提取完整协议包
-             * 每个包格式: header(0xAA) + cmd + addr + len + data + crc + tail(0x55)
-             * 最小包 = 15 字节, 数据包 = 15 + data_len
-             */
-            uint32_t offset = 0;
-            while (offset + 15 <= cur_app_len) {
-                /* 寻找帧头 0xAA */
-                if (app_sram_buf[offset] != PACKET_HEADER) {
-                    offset++;
-                    continue;
-                }
-
-                /* 读取 data_len 字段 (位于 offset + 6, 4 字节 little-endian) */
-                uint32_t data_len = *(uint32_t *)(&app_sram_buf[offset + 6]);
-                if (data_len > BOOT_PACKET_DATA_SIZE) {
-                    offset++;
-                    continue;
-                }
-
-                uint32_t total_pkt_len = 15 + data_len;
-                if (offset + total_pkt_len > cur_app_len) {
-                    break;  /* 包不完整, 等待下次接收 */
-                }
-
-                /* 检查帧尾 */
-                if (app_sram_buf[offset + total_pkt_len - 1] != PACKET_TAIL) {
-                    offset++;
-                    continue;
-                }
-
-                /* 解析出一个完整包, 交给协议栈处理 */
-                boot_protocol_process(&app_sram_buf[offset], total_pkt_len);
-                offset += total_pkt_len;
+            /* 喂给 Ymodem 状态机 (纯解析, 不写 Flash) */
+            int consumed = ymodem_feed_buffer(app_sram_buf, cur_len);
+            if (consumed < 0) {
+                POINT_COLOR = RED;
+                LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Ymodem Error!");
+                HAL_UART_DMAStop(&huart1);
+                return -2;
             }
 
-            /*
-             * 解析完毕，处理剩余的半包数据并重启 DMA
-             */
-            uint32_t remain = cur_app_len - offset;
-            if (remain > 0 && remain < cur_app_len) {
-                memmove(app_sram_buf, &app_sram_buf[offset], remain);
+            /* 移动剩余未处理数据到缓冲区头部 */
+            uint32_t remain = cur_len - (uint32_t)consumed;
+            if (remain > 0) {
+                memmove(app_sram_buf, &app_sram_buf[consumed], remain);
                 app_len = remain;
             } else {
                 app_len = 0;
             }
-            /* 重启 DMA，从 app_len 偏移处继续接收 */
+
+            /*
+             * ★ 先重启 DMA, 再发送 ACK.
+             *    这样上位机收到 ACK 后立刻发送下一包时,
+             *    MCU 的 DMA 已经在运行, 不会丢数据.
+             */
             HAL_UART_Receive_DMA(&huart1, &app_sram_buf[app_len], APP_MAX_SIZE - app_len);
+
+            /* 发送 ACK/NAK/C 响应 */
+            tx_len = ymodem_get_tx_data(tx_data);
+            if (tx_len > 0) {
+                HAL_UART_Transmit(&huart1, tx_data, tx_len, 100);
+            }
+
+            /* 进度显示 */
+            {
+                uint32_t total = ymodem_get_total_size();
+                snprintf(str_buf, sizeof(str_buf), "UART RX: %lu bytes", (unsigned long)total);
+                POINT_COLOR = BLUE;
+                LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, (uint8_t*)str_buf);
+            }
         }
 
-        /* ---- 升级完成 ---- */
-        if (boot_protocol_get_state() == PROT_STATE_DONE) {
+        /* 检查 Ymodem 状态 */
+        YmodemState_t ys = ymodem_get_state();
+        if (ys == YMODEM_STATE_DONE) {
             HAL_UART_DMAStop(&huart1);
             break;
         }
-
-        /* ---- 协议错误 ---- */
-        if (boot_protocol_get_state() == PROT_STATE_ERROR) {
-            LCD_ShowString(30, 210, 200, 16, 16, "Protocol Error!       ");
+        if (ys == YMODEM_STATE_ERROR || ys == YMODEM_STATE_CANCEL) {
+            POINT_COLOR = RED;
+            LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Ymodem Error!");
             HAL_UART_DMAStop(&huart1);
             return -2;
         }
     }
 
-    /* 校验固件 */
+    /* 5. 写入固件元数据并校验 */
+    {
+        uint32_t calc_crc = boot_crc32((const uint8_t*)FLASH_APP_ADDR, g_ymodem_total);
+        FirmwareHeader_t header;
+        header.magic         = FIRMWARE_MAGIC;
+        header.firmware_size = g_ymodem_total;
+        header.firmware_crc  = calc_crc;
+        memset(header.reserved, 0xFF, sizeof(header.reserved));
+
+        uint32_t meta_addr = FLASH_APP_ADDR + FLASH_APP_META_OFFSET;
+        flash_write(meta_addr, (const uint8_t*)&header, sizeof(header));
+    }
+
+    POINT_COLOR = BLACK;
+    LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Verifying...");
+
     if (boot_verify_app() != 0) {
-        LCD_ShowString(30, 210, 200, 16, 16, "Verify Failed!        ");
+        POINT_COLOR = RED;
+        LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Verify Failed!");
         return -3;
     }
 
-    LCD_ShowString(30, 210, 200, 16, 16, "UART Upgrade OK!      ");
+    POINT_COLOR = GREEN;
+    LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "UART Upgrade OK!");
     return 0;
 }

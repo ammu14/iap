@@ -113,13 +113,14 @@ int main(void)
   uint32_t last_key_tick = 0;
 
   LCD_Init();
+  LCD_Clear(WHITE);
 
-  POINT_COLOR = RED;
-  LCD_ShowString(30,  50, 200, 16, 16, "STM32 IAP Bootloader");
-  LCD_ShowString(30,  70, 200, 16, 16, "v1.0.0");
-  LCD_ShowString(30,  90, 200, 16, 16, "====================");
-  LCD_ShowString(30, 110, 200, 16, 16, "Boot: Auto Upgrade");
-  LCD_ShowString(30, 130, 200, 16, 16, "Waiting firmware...");
+  POINT_COLOR = BLUE;
+  LCD_ShowString(LCD_X, LCD_LINE_TITLE, 280, LCD_FONT_H, LCD_FONT_W, "STM32 IAP Bootloader");
+  LCD_ShowString(LCD_X, LCD_LINE_VER,   280, LCD_FONT_H, LCD_FONT_W, BOOT_VERSION);
+  POINT_COLOR = BLACK;
+  LCD_ShowString(LCD_X, LCD_LINE_DIV1,  280, LCD_FONT_H, LCD_FONT_W, "------------------------");
+  LCD_ShowString(LCD_X, LCD_LINE_S1,    280, LCD_FONT_H, LCD_FONT_W, "Initializing...");
 
   boot_manager_init();
 

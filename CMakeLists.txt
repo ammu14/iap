@@ -61,7 +61,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     "BSP/Src/stmflash.c"
     "Boot/Src/iap.c"
     "Boot/Src/boot_verify.c"
-    "Boot/Src/boot_protocol.c"
+    "Boot/Src/ymodem.c"
     "Boot/Src/boot_manager.c"
 )
 

@@ -1,6 +1,6 @@
 # STM32F407ZGT6 IAP Bootloader
 
-基于 STM32F407ZGT6 的 IAP (In-Application Programming) Bootloader，支持 **SD 卡**和**串口**双通道固件升级。
+基于 STM32F407ZGT6 的 IAP (In-Application Programming) Bootloader，版本 **v1.0.0**，支持 **SD 卡**和**串口 (Ymodem)** 双通道固件升级。
 
 ---
 
@@ -44,7 +44,7 @@ boot_manager_init()
               ▼
 ┌─────────────────────────────┐
 │ BOOT_PHASE_IDLE             │  3 秒等待窗口
-│ KEY0:SD  KEY1:UART          │
+│ KEY0:SD  KEY1:UART          │  (LCD 实时提示)
 └─────────────┬───────────────┘
               │
      ┌────────┼────────┐
@@ -84,9 +84,9 @@ boot_manager_init()
 |------|------|------|
 | **Key0** | 短按 | 请求 SD 卡烧写 (`boot_manager_request_sd_upgrade()`) |
 | **Key1** | 短按 | 请求串口烧写 (`boot_manager_request_uart_upgrade()`) |
-| **Key2** | 长按 | 请求串口烧写（备用通道） |
+| **Key2** | 长按 | 请求串口烧写（备用通道，防误触） |
 
-按键扫描以 10ms 间隔在主循环中轮询。
+按键采用**多击状态机**扫描，支持短按 / 长按 / 双击检测，以 10ms 间隔在主循环中轮询。
 
 ---
 
@@ -97,110 +97,135 @@ boot_manager_init()
 1. 将编译好的 `app.bin` 放入 FAT32 格式的 SD 卡根目录
 2. 将 SD 卡插入开发板
 3. 上电后 3 秒内按 **Key0**（或在无限等待模式按 Key0）
-4. Bootloader 自动完成：挂载 → 读文件 → 内部组协议包 → 协议栈写入 → 校验
+4. Bootloader 自动完成：挂载 → 读文件 → 擦除 Flash → 逐块写入 → 写元数据 → CRC 校验
 5. 校验通过后直接跳转到 APP
 
 ### 流程细节
 
-SD 卡烧写与串口烧写使用**同一套协议栈**，区别仅在于数据来源不同：
-- **SD 路径**：从文件读取固件数据，MCU 内部调用 `build_protocol_packet()` 组包
-- **UART 路径**：从 DMA 缓冲区解析协议包
-
-两者最终都经过 `boot_protocol_process()` 统一处理写入和校验：
+SD 卡烧写**直接操作 Flash**，不经过任何协议栈：
 
 ```
 f_mount → f_open("app.bin") → f_size 检查大小
-  → boot_protocol_init() 初始化协议栈
-  → build_protocol_packet(CMD_SYNC)  → boot_protocol_process()  (握手)
-  → build_protocol_packet(CMD_ERASE) → boot_protocol_process()  (请求擦除)
-  → boot_protocol_perform_erase()                                (执行擦除)
-  → 循环 f_read → build_protocol_packet(CMD_WRITE)
-                → boot_protocol_process()                        (写入 Flash)
-  → build_protocol_packet(CMD_WRITE) 元数据 → boot_protocol_process()  (写入 FirmwareHeader)
-  → build_protocol_packet(CMD_VERIFY) → boot_protocol_process()  (CRC32 校验)
+  → erase_app_region()              (擦除 Sector 4~11)
+  → 循环 f_read → flash_write()     (逐块写入 Flash)
+  → 写入 FirmwareHeader 到 APP 区末尾
+  → boot_verify_app()               (CRC32 校验)
   → jump_to_app()
 ```
 
-- **协议包格式与串口完全一致**：Header(0xAA) + Cmd + Addr + Len + Data + CRC32 + Tail(0x55)
 - **bin 文件必须是原始二进制格式**，不需要任何头部或封装
 - 最大支持 960 KB - 32 B ≈ 983008 字节
+- 写入过程中 LCD 实时显示进度
 
 ---
 
-## 5. 串口烧写
+## 5. 串口烧写 (Ymodem)
 
 ### 使用方法
 
+支持**标准 Ymodem 协议**，可选用以下方式之一：
+
+#### 方式 A：专用上位机（推荐）
+
+项目自带跨平台 Ymodem 串口助手，支持 GUI 和 CLI 两种模式：
+
 ```bash
-# 上位机 (PC) 执行
-python Tools/flash_tool.py app.bin -p COM3 -b 115200
+# GUI 模式 (图形界面)
+python Tools/ymodem_sender.py
+
+# CLI 模式 (命令行)
+python Tools/ymodem_sender.py --cli -p COM3 -b 115200 app.bin
+
+# 列出可用串口
+python Tools/ymodem_sender.py --list
 ```
 
-1. MCU 上电后 3 秒内按 **Key1**（或在无限等待模式按 Key1）
-2. LCD 显示 `UART Upgrade mode...`
-3. PC 端运行 `flash_tool.py`，通过串口发送固件
-4. 升级完成后自动复位并跳转
+**GUI 功能：**
+- 串口参数配置（端口 / 波特率 / 数据位 / 停止位 / 校验）
+- 收发区：支持 HEX/文本 显示与发送、定时发送
+- Ymodem 固件升级区：选择 .bin 文件、选择包大小 (128/1024)、进度条显示
+- 数据收发计数、接收数据保存到文件
 
-### 协议格式
+Windows 用户也可直接运行预编译的 `Tools/ymodem_sender.exe`（无需 Python 环境）。
 
-MCU 与 PC 之间使用变长协议包通信：
+#### 方式 B：第三方终端
 
-| 偏移 | 大小 | 字段 |
-|------|------|------|
-| 0 | 1 B | Header `0xAA` |
-| 1 | 1 B | CMD (命令码) |
-| 2 | 4 B | Addr (目标地址, LE) |
-| 6 | 4 B | Len (数据长度, LE) |
-| 10 | Len | Data (固件数据, 最多 1024 B) |
-| 10+Len | 4 B | CRC32 (覆盖 cmd+addr+len+data) |
-| 14+Len | 1 B | Tail `0x55` |
+兼容任何支持 Ymodem 的串口终端：
+- **SecureCRT**: Transfer → Send Ymodem → 选择 app.bin
+- **Tera Term**: File → Transfer → Ymodem → Send
+- **MobaXterm**: 同样支持 Ymodem
 
-### 命令码
+### 操作步骤
 
-| 命令 | 值 | 说明 |
-|------|-----|------|
-| `CMD_SYNC` | `0x55` | 握手同步 |
-| `CMD_ERASE` | `0xAA` | 请求擦除 APP 区（延迟执行） |
-| `CMD_WRITE` | `0xBB` | 写入数据块 |
-| `CMD_VERIFY` | `0xCC` | CRC32 校验固件 |
-| `CMD_RESET` | `0xDD` | 复位 MCU |
+1. MCU 上电后 3 秒内按 **Key1**（或在无限等待模式按 Key1，或用 Key2 长按备用触发）
+2. Bootloader 自动擦除 APP 区，然后发送 `'C'` 字符发起 Ymodem 传输
+3. 在上位机 / 终端中选择 `app.bin` 并通过 Ymodem 发送
+4. Bootloader 逐包接收、写入 Flash 并回 ACK
+5. 传输完成后写入元数据、CRC 校验
+6. 校验通过 → 自动复位跳转
 
-### 延迟擦除机制
+### 协议说明
 
-`CMD_ERASE` 到达时只设置 `PROT_STATE_ERASE_PENDING` 标志，**不立即执行擦除**。主循环检测到该标志后：
-1. 重启 UART DMA（让后续 WRITE 包不会丢失）
-2. 在 DMA 运行期间执行 Flash 擦除（约 5~6 秒）
+Ymodem 是一个广泛使用的**嵌入式固件传输标准协议**，内建 CRC16 校验和自动重传。相比自定义协议：
+- **无需专用上位机** — 任何串口终端软件即可（也可使用本项目自带的上位机）
+- **标准化** — 被众多 Bootloader (U-Boot、MCUBoot 等) 采用
+- **可靠性高** — 每包 128/1024 字节 + CRC16，错误自动重传
 
-这样上位机不需要等待擦除完成就可以持续发送 WRITE 包。
+### 实现细节
 
-### DMA + IDLE 接收机制
-
-- UART 使用 **DMA 循环模式** 接收数据
-- **IDLE 中断** 检测到帧间隙后只置 `is_receiving = 1` 标志位
-- 主循环安全处理：停止 DMA → 读 NDTR 计算已收字节 → 逐包解析 → 重启 DMA
-- 避免在中断上下文中操作 DMA 寄存器导致竞态
+| 项目 | 说明 |
+|------|------|
+| 接收方式 | **DMA 循环模式** + **IDLE 中断** |
+| 数据包大小 | 1024 字节（`BOOT_PACKET_DATA_SIZE`） |
+| 升级超时 | 30 秒无数据自动超时（`UPGRADE_TIMEOUT_MS`） |
+| 协议实现 | `Boot/Src/ymodem.c` / `Boot/Inc/ymodem.h` |
+| 上位机 | `Tools/ymodem_sender.py` (Python 3 + tkinter + pyserial) |
 
 ---
 
-## 6. 编译与烧录
+## 6. LCD 显示
+
+Bootloader 使用 **800×480 LCD** 显示状态信息：
+
+```
+╔══════════════════════════════╗
+║  IAP Bootloader              ║  ← 标题
+║  Version: v1.0.0             ║  ← 版本号
+║  ─────────────────────────   ║  ← 分隔线
+║  APP: Valid / Invalid        ║  ← APP 校验结果
+║  Key0: SD Upgrade            ║  ← 按键提示
+║  Key1: UART Upgrade          ║
+║  ─────────────────────────   ║
+║  [状态信息区域]               ║  ← 烧写进度/状态
+║  ...                         ║
+╚══════════════════════════════╝
+```
+
+布局配置在 `Boot/Inc/boot_config.h` 中（`LCD_X`, `LCD_LINE_*` 等宏）。
+
+---
+
+## 7. 编译与烧录
 
 ### 工具链
 
 - **编译器**: `arm-none-eabi-gcc`
 - **构建系统**: CMake + Ninja
+- **Python**: 3.x（上位机 `ymodem_sender.py` 需要 `pyserial` 库）
 
 ### 编译
+
 
 ```bash
 cmake --preset GCC-Build
 cmake --build build
 ```
 
-输出文件位于 `build/iap.bin` / `build/iap.elf` / `build/iap.hex`。
+输出文件位于 `build/` 目录（`.bin` / `.elf` / `.hex`）。
 
 ### 烧录 Bootloader
 
-使用 J-Link / ST-Link 将 `iap.bin` 烧录到 `0x08000000`：
+使用 J-Link / ST-Link 将 bootloader 固件烧录到 `0x08000000`：
 
 ```bash
 # J-Link 示例
@@ -217,27 +242,32 @@ APP 项目需要：
 
 ---
 
-## 7. 目录结构
+## 8. 目录结构
 
 ```
 iap/
 ├── Boot/                       # Bootloader 核心模块
 │   ├── Inc/
-│   │   ├── boot_config.h       # Flash 布局、超时等配置常量
+│   │   ├── boot_config.h       # Flash 布局、超时、LCD 布局等配置
 │   │   ├── boot_manager.h      # 启动状态机接口
-│   │   ├── boot_protocol.h     # 串口协议定义
 │   │   ├── boot_verify.h       # CRC32 校验接口
-│   │   └── iap.h               # SD 卡 IAP 接口
+│   │   ├── iap.h               # IAP 升级接口 (SD + UART)
+│   │   └── ymodem.h            # Ymodem 协议栈接口
 │   └── Src/
 │       ├── boot_manager.c      # 启动状态机主逻辑
-│       ├── boot_protocol.c     # 串口协议解析与处理
 │       ├── boot_verify.c       # 固件校验 (CRC32 + magic)
-│       └── iap.c               # SD 卡 / 串口烧写 (读文件/收包 → 协议栈处理)
+│       ├── iap.c               # SD 卡 / 串口烧写实现
+│       └── ymodem.c            # Ymodem 协议状态机
 ├── BSP/                        # 板级支持
 │   ├── Inc/
-│   │   └── key.h               # 按键驱动接口
+│   │   ├── delay.h             # 延时接口
+│   │   ├── key.h               # 按键驱动接口 (短按/长按/双击)
+│   │   ├── lcd.h               # LCD 显示驱动接口
+│   │   └── stmflash.h          # Flash 读写接口
 │   └── Src/
-│       ├── key.c               # 按键扫描状态机 (短按/长按/双击)
+│       ├── delay.c             # 微秒级延时
+│       ├── key.c               # 按键多击状态机 + 回调注册
+│       ├── lcd.c               # LCD 显示驱动
 │       └── stmflash.c          # STM32 内部 Flash 读写驱动
 ├── Core/                       # HAL 外设初始化
 │   ├── Inc/
@@ -253,16 +283,22 @@ iap/
 │   └── STM32F4xx_HAL_Driver/
 ├── Middlewares/
 │   └── Third_Party/FatFs/      # FatFs R0.14
-├── Tools/
-│   └── flash_tool.py           # 串口烧录上位机脚本
+├── Tools/                      # 工具集
+│   ├── ymodem_sender.py        # Ymodem 串口助手上位机 (GUI + CLI)
+│   └── ymodem_sender.exe       # Windows 预编译版
+├── cmake/                      # CMake 配置
+│   ├── gcc-arm-none-eabi.cmake # 交叉编译工具链
+│   └── stm32cubemx/            # STM32CubeMX 生成代码的 CMake 集成
 ├── CMakeLists.txt              # CMake 构建配置
+├── CMakePresets.json           # CMake 预设 (GCC-Build)
 ├── STM32F407ZGTx_FLASH.ld      # 链接脚本 (Bootloader @ 0x08000000)
-└── startup_stm32f407xx.s       # 启动汇编
+├── startup_stm32f407xx.s       # 启动汇编
+└── iap.ioc                     # STM32CubeMX 项目配置文件
 ```
 
 ---
 
-## 8. 状态机概览
+## 9. 状态机概览
 
 `boot_manager.c` 中的状态机定义 (`BootPhase_t`)：
 
@@ -276,5 +312,23 @@ STARTUP → CHECK_APP → IDLE ──3秒超时+有效APP→ JUMP_APP
                  │                         └(失败/超时)→ WAIT_KEY/ERROR
                  │
                  └── 3秒超时+无效APP → WAIT_KEY ←── ERROR
-                                           │
-                                      Key0/Key1 → SD_UPGRADE/UPGRADING
+                                            │
+                                       Key0/Key1 → SD_UPGRADE/UPGRADING
+```
+
+---
+
+## 10. 配置常量
+
+主要配置宏定义在 `Boot/Inc/boot_config.h`：
+
+| 宏 | 值 | 说明 |
+|----|----|------|
+| `BOOT_VERSION` | `"v1.0.0"` | Bootloader 版本号 |
+| `FLASH_APP_ADDR` | `0x08010000` | APP 起始地址 |
+| `FLASH_APP_SIZE` | `0x000F0000` (960 KB) | APP 区大小 |
+| `FLASH_APP_META_SIZE` | `32` | 元数据大小 |
+| `FIRMWARE_MAGIC` | `0x544F4F42` | 固件魔数 ("BOOT") |
+| `UPGRADE_TIMEOUT_MS` | `30000` | 升级超时 (30s) |
+| `BOOT_WAIT_TIMEOUT_MS` | `3000` | 启动等待超时 (3s) |
+| `BOOT_PACKET_DATA_SIZE`| `1024` | Ymodem 数据包大小 |
