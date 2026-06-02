@@ -1,9 +1,9 @@
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file    usart.h
+  * @file    sdio.h
   * @brief   This file contains all the function prototypes for
-  *          the usart.c file
+  *          the sdio.c file
   ******************************************************************************
   * @attention
   *
@@ -18,8 +18,8 @@
   */
 /* USER CODE END Header */
 /* Define to prevent recursive inclusion -------------------------------------*/
-#ifndef __USART_H__
-#define __USART_H__
+#ifndef __SDIO_H__
+#define __SDIO_H__
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,23 +32,21 @@ extern "C" {
 
 /* USER CODE END Includes */
 
-extern UART_HandleTypeDef huart1;
+extern SD_HandleTypeDef hsd;
 
 /* USER CODE BEGIN Private defines */
-#define APP_MAX_SIZE       (60 * 1024)  /* 协议包累积缓冲区大小 */
+
 /* USER CODE END Private defines */
 
-void MX_USART1_UART_Init(void);
+void MX_SDIO_SD_Init(void);
 
 /* USER CODE BEGIN Prototypes */
-extern volatile uint32_t app_len;       /* 缓冲区中已接收的有效字节�? */
-extern volatile uint8_t  is_receiving;  /* IDLE 中断通知标志, 主循环消�? */
-extern uint8_t app_sram_buf[];          /* 协议包累积缓冲区, DMA 持续写入 */
+
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* __USART_H__ */
+#endif /* __SDIO_H__ */
 

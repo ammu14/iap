@@ -47,7 +47,7 @@ const uint32_t key_count = sizeof(keys) / sizeof(KeyInfo);
 
 // key0回调
 void Key0_ShortPress_Callback(void) {
-	
+	boot_manager_request_sd_upgrade();
 }
 void Key0_LongPress_Callback(void) {
 
@@ -58,15 +58,7 @@ void Key0_DoublePress_Callback(void) {
 
 // key1回调
 void Key1_ShortPress_Callback(void) {
-#if 0  /* 旧按键跳转流程已废弃, 改用 Boot 层 boot_manager 自动跳转 */
-	if (((*(__IO uint32_t *)(FLASH_APP1_ADDR + 4)) & 0xFF000000) == 0x08000000) {
-		LCD_ShowString(30, 170, 200, 16, 16, "Starting Flash APP...");
-		HAL_Delay(100); 
-		iap_load_app(FLASH_APP1_ADDR);
-	} else {
-		LCD_ShowString(30, 170, 200, 16, 16, "No Valid APP in Flash! ");
-	}
-#endif
+	boot_manager_request_uart_upgrade();
 }
 void Key1_LongPress_Callback(void) {
 
@@ -80,8 +72,8 @@ void Key2_ShortPress_Callback(void) {
 
 }
 void Key2_LongPress_Callback(void) {
-    /* 长按 Key2 进入升级模式, 防止误触 */
-    boot_manager_request_upgrade();
+    /* 长按 Key2 进入串口升级模式, 防止误触 */
+    boot_manager_request_uart_upgrade();
     LCD_ShowString(30, 170, 200, 16, 16, "Upgrade requested...");
 }
 void Key2_DoublePress_Callback(void) {

@@ -53,20 +53,21 @@ static int validate_packet_crc(const uint8_t *buf, uint32_t pkt_len)
  * 此函数耗时较长 (~5 秒), 调用者必须确保 DMA 正在运行中,
  * 以便在此期间接收上位机后续发来的 WRITE 包。
  */
-static void erase_app_region(void)
+static char str_buf[40];
+void erase_app_region(void)
 {
     uint32_t app_start = FLASH_APP_ADDR;
     uint32_t app_end   = FLASH_APP_ADDR + FLASH_APP_SIZE;
 
-    char str_buf[40];
-
     /* 先清空状态显示区域, 避免残留文字 */
     LCD_Fill(30, 210, 230, 226, WHITE);
+
+    __disable_irq();
 
     /* 依次擦除 APP 区域内的每个扇区 */
     uint32_t addr = app_start;
     while (addr < app_end) {
-        sprintf(str_buf, "Erasing 0x%08X...", (unsigned int)addr);
+        snprintf(str_buf, sizeof(str_buf), "Erasing 0x%08X...", (unsigned int)addr);
         LCD_Fill(30, 210, 230, 226, WHITE);
         LCD_ShowString(30, 210, 200, 16, 16, (uint8_t *)str_buf);
         stmflash_erase_addr(addr);
@@ -78,9 +79,7 @@ static void erase_app_region(void)
             addr += 0x20000;    /* Sector 5-11 是 128KB */
         }
     }
-
-    LCD_Fill(30, 210, 230, 226, WHITE);
-    LCD_ShowString(30, 210, 200, 16, 16, "Erase done.         ");
+    __enable_irq();
 
     /* 擦除完后写回全 0xFF 的元数据 */
     FirmwareHeader_t header;

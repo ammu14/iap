@@ -56,7 +56,7 @@ typedef enum {
  * 初始化协议栈
  */
 void boot_protocol_init(void);
-
+void erase_app_region(void);
 /*
  * 处理一个协议包
  *   buf : 指向接收到的完整协议包

@@ -19,7 +19,10 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "dma.h"
+#include "fatfs.h"
 #include "rtc.h"
+#include "sdio.h"
+#include "spi.h"
 #include "usart.h"
 #include "gpio.h"
 #include "fsmc.h"
@@ -32,6 +35,8 @@
 #include "stdio.h"
 #include "boot_manager.h"
 #include "boot_verify.h"
+#include <stdint.h>
+#include "iap.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -51,7 +56,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 
-  /* USER CODE BEGIN PV */
+/* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
 
@@ -100,12 +105,14 @@ int main(void)
   MX_FSMC_Init();
   MX_RTC_Init();
   MX_USART1_UART_Init();
+  MX_SDIO_SD_Init();
+  MX_SPI1_Init();
+  MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
 
-  // 记录上一次按键轮询的时间戳
   uint32_t last_key_tick = 0;
 
-  LCD_Init();                             /* 初始化LCD */
+  LCD_Init();
 
   POINT_COLOR = RED;
   LCD_ShowString(30,  50, 200, 16, 16, "STM32 IAP Bootloader");
@@ -114,7 +121,6 @@ int main(void)
   LCD_ShowString(30, 110, 200, 16, 16, "Boot: Auto Upgrade");
   LCD_ShowString(30, 130, 200, 16, 16, "Waiting firmware...");
 
-  /* 初始化 Bootloader 状态机 */
   boot_manager_init();
 
   /* USER CODE END 2 */
@@ -128,10 +134,10 @@ int main(void)
     /* USER CODE BEGIN 3 */
     uint32_t current_tick = HAL_GetTick();
         
-    /* 1. 执行 Bootloader 状态机 */
+    /* execute bootloader state machine */
     boot_manager_run();
 
-    /* 2. 按键轮询: 每 10ms 执行一次 */
+    /* key poll: every 10ms */
     if (current_tick - last_key_tick >= 10) 
     {
       last_key_tick = current_tick;
@@ -190,6 +196,8 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+
 
 /* USER CODE END 4 */
 

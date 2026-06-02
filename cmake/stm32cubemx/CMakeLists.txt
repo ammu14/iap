@@ -14,8 +14,11 @@ target_compile_definitions(stm32cubemx INTERFACE
 
 target_include_directories(stm32cubemx INTERFACE
     ../../Core/Inc
+    ../../FATFS/Target
+    ../../FATFS/App
     ../../Drivers/STM32F4xx_HAL_Driver/Inc
     ../../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy
+    ../../Middlewares/Third_Party/FatFs/src
     ../../Drivers/CMSIS/Device/ST/STM32F4xx/Include
     ../../Drivers/CMSIS/Include
 )
@@ -26,10 +29,15 @@ target_sources(stm32cubemx INTERFACE
     ../../Core/Src/dma.c
     ../../Core/Src/fsmc.c
     ../../Core/Src/rtc.c
+    ../../Core/Src/sdio.c
+    ../../Core/Src/spi.c
     ../../Core/Src/usart.c
     ../../Core/Src/stm32f4xx_it.c
     ../../Core/Src/stm32f4xx_hal_msp.c
-    ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_ll_fsmc.c
+    ../../FATFS/Target/bsp_driver_sd.c
+    ../../FATFS/Target/sd_diskio.c
+    ../../FATFS/Target/user_diskio.c
+    ../../FATFS/App/fatfs.c
     ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_rcc.c
     ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_rcc_ex.c
     ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_flash.c
@@ -43,13 +51,21 @@ target_sources(stm32cubemx INTERFACE
     ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_cortex.c
     ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal.c
     ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_exti.c
+    ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_ll_fsmc.c
     ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_sram.c
     ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_rtc.c
     ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_rtc_ex.c
+    ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_ll_sdmmc.c
+    ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_sd.c
+    ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_spi.c
     ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_tim.c
     ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_tim_ex.c
     ../../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_uart.c
     ../../Core/Src/system_stm32f4xx.c
+    ../../Middlewares/Third_Party/FatFs/src/diskio.c
+    ../../Middlewares/Third_Party/FatFs/src/ff.c
+    ../../Middlewares/Third_Party/FatFs/src/ff_gen_drv.c
+    ../../Middlewares/Third_Party/FatFs/src/option/syscall.c
     ../../Core/Src/sysmem.c
     ../../Core/Src/syscalls.c
     ../../startup_stm32f407xx.s

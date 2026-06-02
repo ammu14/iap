@@ -34,6 +34,13 @@ enable_language(C ASM)
 project(${CMAKE_PROJECT_NAME})
 message("Build type: " ${CMAKE_BUILD_TYPE})
 
+# 优化选项：减小代码体积
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Os -ffunction-sections -fdata-sections")
+set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -Os")
+
+# 链接时去除未使用的节
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
+
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
 

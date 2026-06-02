@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include "boot_config.h"
 #include "boot_verify.h"
-#include "boot_protocol.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -14,12 +13,20 @@ extern "C" {
 typedef enum {
     BOOT_PHASE_STARTUP,         /* 上电初始化 */
     BOOT_PHASE_CHECK_APP,       /* 检查已有 APP */
-    BOOT_PHASE_IDLE,            /* 空闲等待 */
-    BOOT_PHASE_UPGRADING,       /* 固件升级中 */
-    BOOT_PHASE_VERIFYING,       /* 升级后校验 */
+    BOOT_PHASE_IDLE,            /* 空闲等待 (3秒内检测按键) */
+    BOOT_PHASE_SD_UPGRADE,      /* SD卡升级中 */
+    BOOT_PHASE_UART_UPGRADE,    /* 串口升级中 */
+    BOOT_PHASE_WAIT_KEY,        /* 无合法固件, 等待按键选择 */
     BOOT_PHASE_JUMP_APP,        /* 跳转 APP */
     BOOT_PHASE_ERROR            /* 错误状态 */
 } BootPhase_t;
+
+/* 升级模式 */
+typedef enum {
+    BOOT_MODE_NONE = 0,
+    BOOT_MODE_SD,               /* SD 卡烧写 */
+    BOOT_MODE_UART              /* 串口烧写 */
+} BootMode_t;
 
 /*
  * Bootloader 主状态机初始化
@@ -31,11 +38,15 @@ void boot_manager_init(void);
  */
 void boot_manager_run(void);
 
+/*
+ * 请求进入 SD 卡升级模式 (Key0 触发)
+ */
+void boot_manager_request_sd_upgrade(void);
 
 /*
- * 请求进入升级模式 (由按键等外部事件触发)
+ * 请求进入串口升级模式 (Key1 触发)
  */
-void boot_manager_request_upgrade(void);
+void boot_manager_request_uart_upgrade(void);
 
 #ifdef __cplusplus
 }
