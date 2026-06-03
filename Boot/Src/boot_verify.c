@@ -1,5 +1,7 @@
 #include "boot_verify.h"
+#include "stmflash.h"
 #include <string.h>
+#include <stdio.h>
 
 /* CRC32 查找表 */
 static const uint32_t crc32_table[256] = {
@@ -47,16 +49,17 @@ uint32_t boot_crc32(const uint8_t *buf, uint32_t len)
 }
 
 /*
- * 从 APP 区末尾读取固件元数据 (32 字节)
- * 元数据地址 = FLASH_APP_ADDR + FLASH_APP_META_OFFSET
+ * 从指定槽末尾读取固件元数据 (32 字节)
+ * 元数据地址 = slot_addr + slot_size - FLASH_APP_META_SIZE
  */
-static int boot_verify_header(FirmwareHeader_t *header)
+static int boot_verify_header_at(uint32_t slot_addr, uint32_t slot_size,
+                                  FirmwareHeader_t *header)
 {
     if (header == NULL) return -1;
 
-    uint32_t meta_addr = FLASH_APP_ADDR + FLASH_APP_META_OFFSET;
+    uint32_t meta_addr = slot_addr + slot_size - FLASH_APP_META_SIZE;
 
-    /* 从 Flash 直接读取 32 字节固件元数据 */
+    /* 从 Flash 直接读取固件元数据 */
     memcpy(header, (const void *)meta_addr, sizeof(FirmwareHeader_t));
 
     /* 检查魔数 */
@@ -64,8 +67,9 @@ static int boot_verify_header(FirmwareHeader_t *header)
         return -2;  /* 魔数不匹配 */
     }
 
-    /* 检查固件大小是否合法 (0 ~ FLASH_APP_SIZE - FLASH_APP_META_SIZE) */
-    if (header->firmware_size > (FLASH_APP_SIZE - FLASH_APP_META_SIZE)) {
+    /* 检查固件大小是否合法 */
+    if (header->firmware_size == 0 ||
+        header->firmware_size > (slot_size - FLASH_APP_META_SIZE)) {
         return -3;  /* 固件大小非法 */
     }
 
@@ -73,38 +77,103 @@ static int boot_verify_header(FirmwareHeader_t *header)
 }
 
 /*
- * 校验固件本体 CRC (数据在 FLASH_APP_ADDR 开始)
+ * 校验指定槽的固件
  */
-static int boot_verify_crc(uint32_t size, uint32_t expected)
-{
-    uint32_t calc_crc = boot_crc32((const uint8_t *)FLASH_APP_ADDR, size);
-    return (calc_crc == expected) ? 0 : -1;
-}
-
-/*
- * 综合校验 APP
- *
- * 关键: 固件元数据放在 APP 区末尾 (FLASH_APP_META_OFFSET 偏移),
- * 固件本体从 0x08010000 开始连续存放, 向量表位置不受影响。
- * APP 编译时 VTOR 可以设为 0x08010000 或 0x08000000,
- * 都不影响 bootloader 跳转和 APP 自身运行。
- */
-int boot_verify_app(void)
+int boot_verify_slot(uint32_t slot_addr, uint32_t slot_size, uint32_t *fw_size)
 {
     FirmwareHeader_t header;
     int ret;
 
-    /* 步骤 1: 读取并校验固件元数据 (尾部 32 字节) */
-    ret = boot_verify_header(&header);
+    /* 步骤 1: 读取并校验固件元数据 */
+    ret = boot_verify_header_at(slot_addr, slot_size, &header);
     if (ret != 0) {
+        printf("[VERIFY] Slot 0x%08lX header invalid (err=%d)\r\n", slot_addr, ret);
         return ret;
     }
 
-    /* 步骤 2: 校验固件本体 CRC (从 0x08010000 开始的 header.firmware_size 字节) */
-    ret = boot_verify_crc(header.firmware_size, header.firmware_crc);
-    if (ret != 0) {
-        return -4;  /* CRC 校验失败 */
+    /* 步骤 2: 校验固件本体 CRC */
+    uint32_t calc_crc = boot_crc32((const uint8_t *)slot_addr, header.firmware_size);
+    if (calc_crc != header.firmware_crc) {
+        printf("[VERIFY] Slot 0x%08lX CRC mismatch\r\n", slot_addr);
+        return -4;
     }
 
-    return 0;  /* APP 校验通过 */
+    if (fw_size != NULL) {
+        *fw_size = header.firmware_size;
+    }
+
+    printf("[VERIFY] Slot 0x%08lX OK, size=%lu\r\n", slot_addr, header.firmware_size);
+    return 0;
+}
+
+/*
+ * 综合校验 APP (默认校验 Slot A)
+ */
+int boot_verify_app(void)
+{
+    return boot_verify_slot(FLASH_SLOT_A_ADDR, FLASH_SLOT_A_SIZE, NULL);
+}
+
+/*
+ * 将固件从源槽复制到目标槽 (Flash 内部复制)
+ * 先擦除目标区域, 再按页写入
+ */
+#define COPY_BUF_SIZE   256    /* 一次复制 256 字节 */
+
+int boot_flash_copy(uint32_t src_addr, uint32_t dst_addr, uint32_t size)
+{
+    uint8_t buf[COPY_BUF_SIZE];
+    uint32_t offset = 0;
+    int ret;
+
+    printf("[COPY] Flash copy 0x%08lX -> 0x%08lX, %lu bytes\r\n",
+           src_addr, dst_addr, size);
+
+    /* 按扇区擦除目标区域 */
+    uint32_t erase_start = dst_addr;
+    uint32_t erase_end   = dst_addr + size;
+    uint32_t sector_cnt  = stmflash_get_sector(erase_end - 1) -
+                           stmflash_get_sector(erase_start) + 1;
+
+    for (uint32_t i = 0; i < sector_cnt; i++) {
+        uint32_t sec = stmflash_get_sector(erase_start) + i;
+        printf("[COPY] Erasing sector %lu\r\n", sec);
+        stmflash_erase_sector(sec);
+    }
+
+    /* 按页复制 */
+    printf("[COPY] Writing...\r\n");
+    while (offset < size) {
+        uint32_t chunk = size - offset;
+        if (chunk > COPY_BUF_SIZE) {
+            chunk = COPY_BUF_SIZE;
+        }
+
+        /* 从源地址读取 */
+        memcpy(buf, (const void *)(src_addr + offset), chunk);
+
+        /* 写入目标地址 */
+        ret = stmflash_write(dst_addr + offset, (uint32_t *)buf, chunk);
+        if (ret != 0) {
+            printf("[COPY] Write error at offset 0x%08lX\r\n", offset);
+            return -1;
+        }
+
+        offset += chunk;
+
+        /* 进度指示 */
+        if ((offset & 0x7FFF) == 0) {
+            printf("[COPY] Progress: %lu / %lu\r\n", offset, size);
+        }
+    }
+
+    /* 校验 */
+    printf("[COPY] Verifying...\r\n");
+    if (memcmp((const void *)src_addr, (const void *)dst_addr, size) != 0) {
+        printf("[COPY] Verify failed!\r\n");
+        return -1;
+    }
+
+    printf("[COPY] Done.\r\n");
+    return 0;
 }

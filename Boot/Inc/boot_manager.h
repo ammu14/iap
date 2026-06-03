@@ -21,13 +21,6 @@ typedef enum {
     BOOT_PHASE_ERROR            /* 错误状态 */
 } BootPhase_t;
 
-/* 升级模式 */
-typedef enum {
-    BOOT_MODE_NONE = 0,
-    BOOT_MODE_SD,               /* SD 卡烧写 */
-    BOOT_MODE_UART              /* 串口烧写 */
-} BootMode_t;
-
 /*
  * Bootloader 主状态机初始化
  */

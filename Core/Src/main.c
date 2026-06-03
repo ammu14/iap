@@ -25,11 +25,8 @@
 #include "spi.h"
 #include "usart.h"
 #include "gpio.h"
-#include "fsmc.h"
-
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "lcd.h"
 #include "key.h"
 #include "delay.h"
 #include "stdio.h"
@@ -102,7 +99,6 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
-  MX_FSMC_Init();
   MX_RTC_Init();
   MX_USART1_UART_Init();
   MX_SDIO_SD_Init();
@@ -112,15 +108,10 @@ int main(void)
 
   uint32_t last_key_tick = 0;
 
-  LCD_Init();
-  LCD_Clear(WHITE);
-
-  POINT_COLOR = BLUE;
-  LCD_ShowString(LCD_X, LCD_LINE_TITLE, 280, LCD_FONT_H, LCD_FONT_W, "STM32 IAP Bootloader");
-  LCD_ShowString(LCD_X, LCD_LINE_VER,   280, LCD_FONT_H, LCD_FONT_W, BOOT_VERSION);
-  POINT_COLOR = BLACK;
-  LCD_ShowString(LCD_X, LCD_LINE_DIV1,  280, LCD_FONT_H, LCD_FONT_W, "------------------------");
-  LCD_ShowString(LCD_X, LCD_LINE_S1,    280, LCD_FONT_H, LCD_FONT_W, "Initializing...");
+  printf("\r\n========================================\r\n");
+  printf("  STM32 IAP Bootloader %s\r\n", BOOT_VERSION);
+  printf("========================================\r\n");
+  printf("Initializing...\r\n");
 
   boot_manager_init();
 
@@ -198,7 +189,14 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
-
+/*
+ * printf 重定向到 USART1 (轮询发送)
+ */
+int __io_putchar(int ch)
+{
+  HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 10);
+  return ch;
+}
 
 /* USER CODE END 4 */
 

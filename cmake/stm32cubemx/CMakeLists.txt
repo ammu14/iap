@@ -27,7 +27,6 @@ target_sources(stm32cubemx INTERFACE
     ../../Core/Src/main.c
     ../../Core/Src/gpio.c
     ../../Core/Src/dma.c
-    ../../Core/Src/fsmc.c
     ../../Core/Src/rtc.c
     ../../Core/Src/sdio.c
     ../../Core/Src/spi.c

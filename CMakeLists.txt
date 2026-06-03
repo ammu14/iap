@@ -19,7 +19,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Set the project name
-set(CMAKE_PROJECT_NAME e-book)
+set(CMAKE_PROJECT_NAME iap)
 
 # Include toolchain file
 include("cmake/gcc-arm-none-eabi.cmake")
@@ -57,12 +57,14 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     "BSP/Src/delay.c"
     "BSP/Src/key.c"
-    "BSP/Src/lcd.c"
     "BSP/Src/stmflash.c"
+    "BSP/Src/w25Q128.c"
     "Boot/Src/iap.c"
     "Boot/Src/boot_verify.c"
     "Boot/Src/ymodem.c"
     "Boot/Src/boot_manager.c"
+    "Boot/Src/boot_storage.c"
+    "Boot/Src/boot_confirm.c"
 )
 
 # Add include paths

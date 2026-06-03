@@ -1,5 +1,4 @@
 #include "key.h"
-#include "lcd.h"
 #include "stm32f4xx_hal.h"
 #include <stdint.h>
 #include "boot_manager.h"
@@ -74,7 +73,6 @@ void Key2_ShortPress_Callback(void) {
 void Key2_LongPress_Callback(void) {
     /* 长按 Key2 进入串口升级模式, 防止误触 */
     boot_manager_request_uart_upgrade();
-    LCD_ShowString(30, 170, 200, 16, 16, "Upgrade requested...");
 }
 void Key2_DoublePress_Callback(void) {
 

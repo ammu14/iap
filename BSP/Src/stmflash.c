@@ -162,3 +162,38 @@ void stmflash_erase_addr(uint32_t addr) {
 
 	FLASH->CR |= FLASH_CR_LOCK;
 }
+
+/*
+ * 擦除指定扇区编号的扇区 (带解锁/上锁)
+ */
+void stmflash_erase_sector(uint32_t sector_idx) {
+	if (sector_idx > 11) return;
+
+	if (FLASH->CR & FLASH_CR_LOCK) {
+		FLASH->KEYR = 0x45670123;
+		FLASH->KEYR = 0xCDEF89AB;
+	}
+
+	__disable_irq();
+	stmflash_erase_sector_internal(sector_idx);
+	__enable_irq();
+
+	FLASH->CR |= FLASH_CR_LOCK;
+}
+
+/*
+ * 获取地址所属的扇区编号
+ */
+uint32_t stmflash_get_sector(uint32_t addr) {
+	return (uint32_t)GetSector(addr);
+}
+
+/*
+ * 按字节写入 Flash (内部自动对齐到 word 并自动擦除跨扇区)
+ * 这是 stmflash_write_word 的字节级封装
+ */
+int stmflash_write(uint32_t addr, uint32_t *pbuf, uint32_t len) {
+	/* 将字节数向上取整到 word 数 */
+	uint32_t words = (len + 3) / 4;
+	return (int)stmflash_write_word(addr, pbuf, words);
+}

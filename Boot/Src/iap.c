@@ -1,11 +1,11 @@
 #include "iap.h"
 #include "boot_config.h"
+#include "boot_storage.h"
 #include "boot_verify.h"
 #include "ymodem.h"
 #include "ff.h"
 #include "stm32f407xx.h"
 #include "fatfs.h"
-#include "lcd.h"
 #include "usart.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -19,17 +19,29 @@ static iapfun jump2app;
 extern DMA_HandleTypeDef  hdma_usart1_rx;
 extern UART_HandleTypeDef huart1;
 
+/* Ymodem 接收缓冲区 */
+extern uint8_t           app_sram_buf[];
+extern volatile uint32_t app_len;
+extern volatile uint8_t  is_receiving;
+
 /*
- * 跳转到 APP 区执行
+ * 跳转到 APP 区执行 (通用, 不限定 Slot)
  */
 void iap_load_app(uint32_t appxaddr)
 {
     if (((*(__IO uint32_t*)appxaddr) & 0x2FFE0000) == 0x20000000)
-    { 
-        __disable_irq();   
+    {
+        /* 等待 USART TX 完成, 避免最后一字节被截断产生乱码 */
+        while (!(USART1->SR & USART_SR_TC)) { }
+
+        /* 关闭 USART1, 并将 TX 引脚拉高, 防止 APP 启动时 GPIO 初始化产生垃圾字节 */
+        HAL_UART_DeInit(&huart1);
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, GPIO_PIN_SET);
+
+        __disable_irq();
         __set_MSP(*(__IO uint32_t*)appxaddr);
         uint32_t jump_addr = *(__IO uint32_t*)(appxaddr + 4);
-        jump2app = (iapfun)jump_addr;  
+        jump2app = (iapfun)jump_addr;
         jump2app();
     }
 }
@@ -60,286 +72,259 @@ static int flash_write(uint32_t addr, const uint8_t *data, uint32_t len)
     return 0;
 }
 
-/* ====== 擦除整个 APP 区 (Sector 4~11, 960KB) ====== */
-static int erase_app_region(void)
+/* ====== 擦除指定槽的全部扇区 ====== */
+static int erase_slot(uint8_t slot)
 {
-    static const uint32_t sector_addrs[] = {
-        0x08010000, /* Sector 4  (64KB)  */
-        0x08020000, /* Sector 5  (128KB) */
-        0x08040000, /* Sector 6  (128KB) */
-        0x08060000, /* Sector 7  (128KB) */
-        0x08080000, /* Sector 8  (128KB) */
-        0x080A0000, /* Sector 9  (128KB) */
-        0x080C0000, /* Sector 10 (128KB) */
-        0x080E0000, /* Sector 11 (128KB) */
-    };
+    uint32_t slot_addr = BOOT_SLOT_ADDR(slot);
+    uint32_t slot_size = BOOT_SLOT_SIZE(slot);
 
-    for (int i = 0; i < 8; i++) {
-        stmflash_erase_addr(sector_addrs[i]);
+    uint32_t end_addr = slot_addr + slot_size;
+    for (uint32_t addr = slot_addr; addr < end_addr; ) {
+        stmflash_erase_addr(addr);
+
+        /* 根据扇区大小递增地址 */
+        if (addr < 0x08000000 + 0x10000) {
+            /* Sector 0~3: 16KB each */
+            addr += 0x4000;
+        } else if (addr < 0x08000000 + 0x20000) {
+            /* Sector 4: 64KB */
+            addr += 0x10000;
+        } else if (addr < 0x08000000 + 0x80000) {
+            /* Sector 5~7: 128KB each */
+            addr += 0x20000;
+        } else {
+            /* Sector 8~11: 128KB each */
+            addr += 0x20000;
+        }
     }
     return 0;
 }
 
-/* ====== Ymodem 回调 ====== */
-static int ymodem_flash_cb(uint32_t offset, const uint8_t *data, uint32_t len)
+/* ====== 写入固件元数据到槽末尾 ====== */
+static int write_meta_to_slot(uint8_t slot, uint32_t fw_size)
 {
-    return flash_write(FLASH_APP_ADDR + offset, data, len);
+    uint32_t slot_addr = BOOT_SLOT_ADDR(slot);
+    uint32_t meta_addr = BOOT_SLOT_META_ADDR(slot);
+
+    uint32_t calc_crc = boot_crc32((const uint8_t*)slot_addr, fw_size);
+    FirmwareHeader_t header;
+    header.magic         = FIRMWARE_MAGIC;
+    header.firmware_size = fw_size;
+    header.firmware_crc  = calc_crc;
+    memset(header.reserved, 0xFF, sizeof(header.reserved));
+
+    return flash_write(meta_addr, (const uint8_t*)&header, sizeof(header));
 }
 
+/* ====== Ymodem 回调 (动态绑定槽) ====== */
+static uint32_t g_target_slot_addr = 0;
 static uint32_t g_ymodem_total = 0;
+static uint8_t  g_target_slot = 0;
+
+static int ymodem_flash_cb(uint32_t offset, const uint8_t *data, uint32_t len)
+{
+    return flash_write(g_target_slot_addr + offset, data, len);
+}
+
 static void ymodem_done_cb(uint32_t total_size)
 {
     g_ymodem_total = total_size;
 }
 
 /* ======================================================================
- * SD 卡升级
+ * 统一升级 API: iap_load_to_slot(slot, mode)
  *
- * 直接从 SD 卡读取 app.bin, 擦除 Flash 后逐块写入.
- * 不经过任何协议栈, 是最快的升级路径.
+ *   slot: BOOT_SLOT_A (0) 或 BOOT_SLOT_B (1)
+ *   mode: IAP_MODE_SD (0) 或 IAP_MODE_UART (1)
+ *
+ * 返回 0 成功, 负数失败.
  * ====================================================================== */
-int iap_load_from_sd(void) 
+int iap_load_to_slot(uint8_t slot, uint8_t mode)
 {
-    FRESULT res;
-    FIL fil;
-    UINT br;
-    uint32_t flash_addr = FLASH_APP_ADDR;
-    uint8_t read_buf[1024];
-    static char str_buf[40];
+    uint32_t slot_addr = BOOT_SLOT_ADDR(slot);
+    uint32_t slot_size = BOOT_SLOT_SIZE(slot);
+    const char *slot_name = (slot == BOOT_SLOT_A) ? "A" : "B";
+    const char *mode_name = (mode == IAP_MODE_SD) ? "SD" : "UART";
 
-    /* 1. 挂载 SD */
-    res = f_mount(&SDFatFS, SDPath, 1);
-    if (res != FR_OK) {
-        POINT_COLOR = RED;
-        LCD_ShowString(LCD_X, LCD_LINE_S2, 280, LCD_FONT_H, LCD_FONT_W, "SD: Mount FAIL!");
-        return -1;
-    }
+    printf("[IAP] Target: Slot %s via %s (0x%08lX, %luKB)\r\n",
+           slot_name, mode_name,
+           (unsigned long)slot_addr,
+           (unsigned long)(slot_size / 1024));
 
-    /* 2. 打开 app.bin */
-    res = f_open(&fil, "app.bin", FA_READ);
-    if (res != FR_OK) {
-        POINT_COLOR = RED;
-        LCD_ShowString(LCD_X, LCD_LINE_S2, 280, LCD_FONT_H, LCD_FONT_W, "SD: app.bin not found!");
-        f_mount(NULL, SDPath, 1);
-        return -2;
-    }
+    /* 擦除目标槽 */
+    printf("[IAP] Erasing Slot %s...\r\n", slot_name);
+    erase_slot(slot);
 
-    FSIZE_t fsize = f_size(&fil);
-    if (fsize > FLASH_APP_SIZE - FLASH_APP_META_SIZE) {
-        POINT_COLOR = RED;
-        LCD_ShowString(LCD_X, LCD_LINE_S2, 280, LCD_FONT_H, LCD_FONT_W, "SD: File too large!");
-        f_close(&fil);
-        f_mount(NULL, SDPath, 1);
-        return -3;
-    }
+    /* ---- SD 卡模式 ---- */
+    if (mode == IAP_MODE_SD) {
+        FRESULT res;
+        FIL fil;
+        UINT br;
+        uint32_t flash_addr = slot_addr;
+        uint8_t read_buf[1024];
 
-    snprintf(str_buf, sizeof(str_buf), "SD: %lu bytes", (unsigned long)fsize);
-    POINT_COLOR = BLACK;
-    LCD_ShowString(LCD_X, LCD_LINE_S2, 280, LCD_FONT_H, LCD_FONT_W, (uint8_t*)str_buf);
-
-    /* 3. 擦除 APP 区 */
-    POINT_COLOR = BLACK;
-    LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Erasing...");
-    erase_app_region();
-
-    /* 4. 逐块写入 Flash */
-    while (f_read(&fil, read_buf, sizeof(read_buf), &br) == FR_OK && br > 0) {
-        flash_write(flash_addr, read_buf, br);
-        flash_addr += br;
-
-        snprintf(str_buf, sizeof(str_buf), "Writing %lu/%lu",
-                 (unsigned long)(flash_addr - FLASH_APP_ADDR), (unsigned long)fsize);
-        POINT_COLOR = BLUE;
-        LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, (uint8_t*)str_buf);
-
-        if (br < sizeof(read_buf))
-            break;
-    }
-
-    f_close(&fil);
-    f_mount(NULL, SDPath, 1);
-
-    /* 5. 写入固件元数据 */
-    {
-        uint32_t calc_crc = boot_crc32((const uint8_t*)FLASH_APP_ADDR, (uint32_t)fsize);
-        FirmwareHeader_t header;
-        header.magic         = FIRMWARE_MAGIC;
-        header.firmware_size = (uint32_t)fsize;
-        header.firmware_crc  = calc_crc;
-        memset(header.reserved, 0xFF, sizeof(header.reserved));
-
-        uint32_t meta_addr = FLASH_APP_ADDR + FLASH_APP_META_OFFSET;
-        flash_write(meta_addr, (const uint8_t*)&header, sizeof(header));
-    }
-
-    /* 6. 校验 */
-    POINT_COLOR = BLACK;
-    LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Verifying...");
-
-    if (boot_verify_app() != 0) {
-        POINT_COLOR = RED;
-        LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Verify FAILED!");
-        return -4;
-    }
-
-    POINT_COLOR = GREEN;
-    LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "SD Upgrade OK!");
-    return 0;
-}
-
-/* ======================================================================
- * 串口升级 (Ymodem 协议)
- *
- * 使用标准 Ymodem 协议, 兼容 SecureCRT / Tera Term / SSCOM 等
- * 任何支持 Ymodem 发送的串口终端.
- *
- * 流程:
- *   1. 擦除 APP 区
- *   2. 启动 UART DMA 接收
- *   3. 发送 'C' → 终端开始 Ymodem 传输
- *   4. 循环: IDLE 中断收数据 → 喂 ymodem 状态机 → 回 ACK/NAK
- *   5. 传输完成 → 写元数据 → 校验
- * ====================================================================== */
-int iap_load_from_uart(void)
-{
-    uint8_t tx_data[2];
-    static char str_buf[40];
-
-    /* 1. 初始化 Ymodem 并擦除 APP 区 */
-    ymodem_init(ymodem_flash_cb, ymodem_done_cb);
-    g_ymodem_total = 0;
-
-    POINT_COLOR = BLACK;
-    LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Erasing...");
-    erase_app_region();
-
-    /* 2. 启动 DMA 循环接收 */
-    HAL_UART_DMAStop(&huart1);
-    app_len      = 0;
-    is_receiving = 0;
-    HAL_UART_Receive_DMA(&huart1, app_sram_buf, APP_MAX_SIZE);
-
-    /* 3. 发送 'C' 发起 Ymodem 传输 */
-    ymodem_reset();
-    int tx_len = ymodem_get_tx_data(tx_data);
-    if (tx_len > 0) {
-        HAL_UART_Transmit(&huart1, tx_data, tx_len, 100);
-    }
-
-    POINT_COLOR = BLACK;
-    LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Waiting Ymodem sender...");
-
-    /* 4. 主循环 */
-    while (1) {
-        uint32_t now = HAL_GetTick();
-
-        /* 初始握手阶段: 如果还没收到任何数据, 每隔500ms重发 'C', 一直等上位机 */
-        {
-            static uint32_t last_c_send = 0;
-            YmodemState_t ys_now = ymodem_get_state();
-            if ((ys_now == YMODEM_STATE_WAIT_HEADER || ys_now == YMODEM_STATE_IDLE)
-                && app_len == 0
-                && now - last_c_send > 500) {
-                uint8_t c = 0x43;
-                HAL_UART_Transmit(&huart1, &c, 1, 100);
-                last_c_send = now;
-            }
+        res = f_mount(&SDFatFS, SDPath, 1);
+        if (res != FR_OK) {
+            printf("[IAP] SD: Mount FAIL!\r\n");
+            return -1;
         }
 
-        /* IDLE 中断通知: 有新的 DMA 数据到达 */
-        if (is_receiving) {
-            /*
-             * ★ 关键: 先快速冻结 DMA 并读取数据量, 然后立刻重启 DMA.
-             *    这样 DMA 只停极短时间, 上位机发送的下一包数据不会丢失.
-             *    ymodem 解析和 Flash 写入在后面进行, DMA 持续运行.
-             */
-            __disable_irq();
-            is_receiving = 0;
-            HAL_UART_DMAStop(&huart1);
-            uint32_t ndtr      = hdma_usart1_rx.Instance->NDTR;
-            uint32_t new_bytes  = APP_MAX_SIZE - ndtr - app_len;
-            if (new_bytes > 0)
-                app_len += new_bytes;
-            uint32_t cur_len = app_len;
-            __enable_irq();
+        res = f_open(&fil, "app.bin", FA_READ);
+        if (res != FR_OK) {
+            printf("[IAP] SD: app.bin not found!\r\n");
+            f_mount(NULL, SDPath, 1);
+            return -2;
+        }
 
-            /* 喂给 Ymodem 状态机 (纯解析, 不写 Flash) */
-            int consumed = ymodem_feed_buffer(app_sram_buf, cur_len);
-            if (consumed < 0) {
-                POINT_COLOR = RED;
-                LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Ymodem Error!");
+        FSIZE_t fsize = f_size(&fil);
+        if (fsize > FLASH_APP_MAX_SIZE) {
+            printf("[IAP] SD: File too large! (%lu > %lu)\r\n",
+                   (unsigned long)fsize, (unsigned long)FLASH_APP_MAX_SIZE);
+            f_close(&fil);
+            f_mount(NULL, SDPath, 1);
+            return -3;
+        }
+
+        printf("[IAP] SD: %lu bytes, writing to Slot %s...\r\n",
+               (unsigned long)fsize, slot_name);
+
+        while (f_read(&fil, read_buf, sizeof(read_buf), &br) == FR_OK && br > 0) {
+            flash_write(flash_addr, read_buf, br);
+            flash_addr += br;
+            printf("[IAP] Writing %lu/%lu\r\n",
+                   (unsigned long)(flash_addr - slot_addr), (unsigned long)fsize);
+            if (br < sizeof(read_buf))
+                break;
+        }
+
+        f_close(&fil);
+        f_mount(NULL, SDPath, 1);
+
+        /* 写元数据 */
+        write_meta_to_slot(slot, (uint32_t)fsize);
+
+        /* 校验 */
+        printf("[IAP] Verifying Slot %s...\r\n", slot_name);
+        uint32_t fw_size;
+        if (boot_verify_slot(slot_addr, slot_size, &fw_size) != 0) {
+            printf("[IAP] Slot %s Verify FAILED!\r\n", slot_name);
+            return -4;
+        }
+
+        printf("[IAP] SD → Slot %s OK (%lu bytes)\r\n", slot_name, (unsigned long)fw_size);
+        return 0;
+    }
+
+    /* ---- UART 模式 ---- */
+    else {
+        uint8_t tx_data[2];
+
+        g_target_slot_addr = slot_addr;
+        g_target_slot = slot;
+        g_ymodem_total = 0;
+
+        ymodem_init(ymodem_flash_cb, ymodem_done_cb);
+
+        printf("[IAP] Waiting Ymodem sender...\r\n");
+
+        HAL_UART_DMAStop(&huart1);
+        app_len      = 0;
+        is_receiving = 0;
+        HAL_UART_Receive_DMA(&huart1, app_sram_buf, APP_MAX_SIZE);
+
+        ymodem_reset();
+        int tx_len = ymodem_get_tx_data(tx_data);
+        if (tx_len > 0) {
+            HAL_UART_Transmit(&huart1, tx_data, tx_len, 100);
+        }
+
+        while (1) {
+            uint32_t now = HAL_GetTick();
+
+            /* 握手阶段: 每500ms发 'C' */
+            {
+                static uint32_t last_c_send = 0;
+                YmodemState_t ys_now = ymodem_get_state();
+                if ((ys_now == YMODEM_STATE_WAIT_HEADER || ys_now == YMODEM_STATE_IDLE)
+                    && app_len == 0
+                    && now - last_c_send > 500) {
+                    uint8_t c = 0x43;
+                    HAL_UART_Transmit(&huart1, &c, 1, 100);
+                    last_c_send = now;
+                }
+            }
+
+            if (is_receiving) {
+                __disable_irq();
+                is_receiving = 0;
+                HAL_UART_DMAStop(&huart1);
+                uint32_t ndtr      = hdma_usart1_rx.Instance->NDTR;
+                uint32_t new_bytes  = APP_MAX_SIZE - ndtr - app_len;
+                if (new_bytes > 0)
+                    app_len += new_bytes;
+                uint32_t cur_len = app_len;
+                __enable_irq();
+
+                int consumed = ymodem_feed_buffer(app_sram_buf, cur_len);
+                if (consumed < 0) {
+                    printf("[IAP] Ymodem Error!\r\n");
+                    HAL_UART_DMAStop(&huart1);
+                    return -2;
+                }
+
+                uint32_t remain = cur_len - (uint32_t)consumed;
+                if (remain > 0) {
+                    memmove(app_sram_buf, &app_sram_buf[consumed], remain);
+                    app_len = remain;
+                } else {
+                    app_len = 0;
+                }
+
+                HAL_UART_Receive_DMA(&huart1, &app_sram_buf[app_len], APP_MAX_SIZE - app_len);
+
+                tx_len = ymodem_get_tx_data(tx_data);
+                if (tx_len > 0) {
+                    HAL_UART_Transmit(&huart1, tx_data, tx_len, 100);
+                }
+            }
+
+            YmodemState_t ys = ymodem_get_state();
+            if (ys == YMODEM_STATE_DONE) {
+                HAL_UART_DMAStop(&huart1);
+                break;
+            }
+            if (ys == YMODEM_STATE_ERROR || ys == YMODEM_STATE_CANCEL) {
+                printf("[IAP] Ymodem Error!\r\n");
                 HAL_UART_DMAStop(&huart1);
                 return -2;
             }
-
-            /* 移动剩余未处理数据到缓冲区头部 */
-            uint32_t remain = cur_len - (uint32_t)consumed;
-            if (remain > 0) {
-                memmove(app_sram_buf, &app_sram_buf[consumed], remain);
-                app_len = remain;
-            } else {
-                app_len = 0;
-            }
-
-            /*
-             * ★ 先重启 DMA, 再发送 ACK.
-             *    这样上位机收到 ACK 后立刻发送下一包时,
-             *    MCU 的 DMA 已经在运行, 不会丢数据.
-             */
-            HAL_UART_Receive_DMA(&huart1, &app_sram_buf[app_len], APP_MAX_SIZE - app_len);
-
-            /* 发送 ACK/NAK/C 响应 */
-            tx_len = ymodem_get_tx_data(tx_data);
-            if (tx_len > 0) {
-                HAL_UART_Transmit(&huart1, tx_data, tx_len, 100);
-            }
-
-            /* 进度显示 */
-            {
-                uint32_t total = ymodem_get_total_size();
-                snprintf(str_buf, sizeof(str_buf), "UART RX: %lu bytes", (unsigned long)total);
-                POINT_COLOR = BLUE;
-                LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, (uint8_t*)str_buf);
-            }
         }
 
-        /* 检查 Ymodem 状态 */
-        YmodemState_t ys = ymodem_get_state();
-        if (ys == YMODEM_STATE_DONE) {
-            HAL_UART_DMAStop(&huart1);
-            break;
+        /* 写元数据 */
+        write_meta_to_slot(slot, g_ymodem_total);
+
+        /* 校验 */
+        printf("[IAP] Verifying Slot %s...\r\n", slot_name);
+        uint32_t fw_size;
+        if (boot_verify_slot(slot_addr, slot_size, &fw_size) != 0) {
+            printf("[IAP] Slot %s Verify Failed!\r\n", slot_name);
+            return -3;
         }
-        if (ys == YMODEM_STATE_ERROR || ys == YMODEM_STATE_CANCEL) {
-            POINT_COLOR = RED;
-            LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Ymodem Error!");
-            HAL_UART_DMAStop(&huart1);
-            return -2;
-        }
+
+        printf("[IAP] UART → Slot %s OK (%lu bytes)\r\n", slot_name, (unsigned long)fw_size);
+        return 0;
     }
+}
 
-    /* 5. 写入固件元数据并校验 */
-    {
-        uint32_t calc_crc = boot_crc32((const uint8_t*)FLASH_APP_ADDR, g_ymodem_total);
-        FirmwareHeader_t header;
-        header.magic         = FIRMWARE_MAGIC;
-        header.firmware_size = g_ymodem_total;
-        header.firmware_crc  = calc_crc;
-        memset(header.reserved, 0xFF, sizeof(header.reserved));
+/* ======================================================================
+ * 兼容旧 API
+ * ====================================================================== */
+int iap_load_from_sd(void)
+{
+    return iap_load_to_slot(BOOT_SLOT_B, IAP_MODE_SD);
+}
 
-        uint32_t meta_addr = FLASH_APP_ADDR + FLASH_APP_META_OFFSET;
-        flash_write(meta_addr, (const uint8_t*)&header, sizeof(header));
-    }
-
-    POINT_COLOR = BLACK;
-    LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Verifying...");
-
-    if (boot_verify_app() != 0) {
-        POINT_COLOR = RED;
-        LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "Verify Failed!");
-        return -3;
-    }
-
-    POINT_COLOR = GREEN;
-    LCD_ShowString(LCD_X, LCD_LINE_S3, 280, LCD_FONT_H, LCD_FONT_W, "UART Upgrade OK!");
-    return 0;
+int iap_load_from_uart(void)
+{
+    return iap_load_to_slot(BOOT_SLOT_B, IAP_MODE_UART);
 }
